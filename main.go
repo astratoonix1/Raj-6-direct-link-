@@ -1131,6 +1131,54 @@ func (c *Cache) getFile(ctx context.Context, id string) *cachedFile {
 
 func (c *Cache) delFile(ctx context.Context, id string) { c.client.Del(ctx, "file:"+id) }
 
+// ---------- Advertise banner (/advertise command) ----------
+// Ek hi global banner slot — jo bhi latest /advertise chalega, wahi
+// dikhega. Redis mein permanent key hai (TTL 0 = kabhi expire nahi
+// hoga khud se), sirf /advertise off se hi hatega.
+type adSettings struct {
+	Enabled bool   `json:"enabled"`
+	Type    string `json:"type"` // "image" ya "video"
+	URL     string `json:"url"`
+}
+
+const advertiseKey = "site:advertise"
+
+func (c *Cache) setAdvertise(ctx context.Context, ad *adSettings) error {
+	b, err := json.Marshal(ad)
+	if err != nil {
+		return err
+	}
+	return c.client.Set(ctx, advertiseKey, b, 0).Err()
+}
+
+func (c *Cache) getAdvertise(ctx context.Context) *adSettings {
+	b, err := c.client.Get(ctx, advertiseKey).Bytes()
+	if err != nil {
+		return nil
+	}
+	var ad adSettings
+	if json.Unmarshal(b, &ad) != nil || !ad.Enabled {
+		return nil
+	}
+	return &ad
+}
+
+func (c *Cache) clearAdvertise(ctx context.Context) { c.client.Del(ctx, advertiseKey) }
+
+// Pending state — admin ne bare "/advertise" bheja (URL diye bina), matlab
+// agla photo/video jo woh bhejega, wahi ad ban jaayega. 5 min ke andar
+// bhejna hoga, warna pending state khud expire ho jaayega.
+func (c *Cache) setAdvertisePending(ctx context.Context, userID int64) {
+	c.client.Set(ctx, fmt.Sprintf("advertise:pending:%d", userID), "1", 5*time.Minute)
+}
+func (c *Cache) isAdvertisePending(ctx context.Context, userID int64) bool {
+	v, err := c.client.Get(ctx, fmt.Sprintf("advertise:pending:%d", userID)).Result()
+	return err == nil && v == "1"
+}
+func (c *Cache) clearAdvertisePending(ctx context.Context, userID int64) {
+	c.client.Del(ctx, fmt.Sprintf("advertise:pending:%d", userID))
+}
+
 // clearAllFileCache wipes every cached file entry ("file:*") — used by /dminem
 // so stale cache doesn't keep serving links after a full delete-all.
 func (c *Cache) clearAllFileCache(ctx context.Context) {
@@ -1846,7 +1894,7 @@ func (a *App) onCommand(ctx context.Context, msg *tgbotapi.Message) {
 		))
 	case "help":
 		a.pool.sendMD(msg.Chat.ID,
-			"*Commands:*\n/start \\- Welcome\n/help \\- Help\n/stats \\- Stats \\(admin\\)\n/expire \\- Set/remove link expiry \\(admin\\)\n/setpass \\- Password\\-protect a link \\(uploader/admin\\)\n/tag \\- Tag a file with Subject/Chapter \\(admin\\)\n/untag \\- Remove a file's Subject/Chapter tag \\(admin\\)\n/setyear \\- Tag a file with a Year 1930\\-2030 \\(admin\\)\n/setepisode \\- Tag a file with a Season/Episode/Part label \\(admin\\)\n/approve \\- Approve a visitor's Access ID \\(admin\\)\n/block \\- Block a visitor's Access ID \\(admin\\)\n/unblock \\- Unblock a visitor's Access ID \\(admin\\)\n/reject \\- Delete a visitor's Access ID completely \\(admin\\)\n/user \\- List recent visitors and their Access IDs \\(admin\\)\n/profile \\- View a visitor's full profile by Access ID \\(admin\\)\n/clearpending \\- Delete all pending visitors \\(admin\\)\n/dashboard \\- Get admin dashboard link \\(admin\\)\n/dminem \\- Delete ALL files \\(admin, asks confirmation\\)\n\nSend any file to get a link\\!\n\nBy default links are *permanent*\\. Use /expire \\<file\\_id\\> \\<time\\> to make one expire \\(e\\.g\\. `7d`, `12h`, `1y`, or `off` to remove it\\)\\.")
+			"*Commands:*\n/start \\- Welcome\n/help \\- Help\n/stats \\- Stats \\(admin\\)\n/expire \\- Set/remove link expiry \\(admin\\)\n/setpass \\- Password\\-protect a link \\(uploader/admin\\)\n/tag \\- Tag a file with Subject/Chapter \\(admin\\)\n/untag \\- Remove a file's Subject/Chapter tag \\(admin\\)\n/setyear \\- Tag a file with a Year 1930\\-2030 \\(admin\\)\n/setepisode \\- Tag a file with a Season/Episode/Part label \\(admin\\)\n/approve \\- Approve a visitor's Access ID \\(admin\\)\n/block \\- Block a visitor's Access ID \\(admin\\)\n/unblock \\- Unblock a visitor's Access ID \\(admin\\)\n/reject \\- Delete a visitor's Access ID completely \\(admin\\)\n/user \\- List recent visitors and their Access IDs \\(admin\\)\n/profile \\- View a visitor's full profile by Access ID \\(admin\\)\n/clearpending \\- Delete all pending visitors \\(admin\\)\n/dashboard \\- Get admin dashboard link \\(admin\\)\n/advertise \\- Set the watch\\-page ad banner \\(admin\\)\n/dminem \\- Delete ALL files \\(admin, asks confirmation\\)\n\nSend any file to get a link\\!\n\nBy default links are *permanent*\\. Use /expire \\<file\\_id\\> \\<time\\> to make one expire \\(e\\.g\\. `7d`, `12h`, `1y`, or `off` to remove it\\)\\.")
 	case "stats":
 		if msg.From.ID != a.cfg.AdminID {
 			a.pool.send(msg.Chat.ID, "❌ Admin only.")
@@ -1870,6 +1918,37 @@ func (a *App) onCommand(ctx context.Context, msg *tgbotapi.Message) {
 			"🖥️ Admin Dashboard\n\n%s\n\n⚠️ Yeh link kisi ko share mat karna — jiske paas yeh link hai woh dashboard dekh sakta hai.\n\n🆔 Kisi bhi watch page pe visitor-lookup icon dikhane ke liye, link ke aakhir mein ?admin=%s laga do.",
 			link, a.cfg.DashboardToken,
 		))
+	case "advertise":
+		if msg.From.ID != a.cfg.AdminID {
+			a.pool.send(msg.Chat.ID, "❌ Admin only.")
+			return
+		}
+		arg := strings.TrimSpace(msg.CommandArguments())
+		switch {
+		case strings.EqualFold(arg, "off"):
+			a.cache.clearAdvertise(ctx)
+			a.pool.send(msg.Chat.ID, "✅ Advertise banner hata diya gaya — watch page pehle jaisa dikhega.")
+		case arg == "":
+			// Bina URL diye bheja hai — agla photo/video hi ad ban jaayega
+			a.cache.setAdvertisePending(ctx, msg.From.ID)
+			a.pool.send(msg.Chat.ID,
+				"📸 Theek hai — ab agla photo ya video jo tum bhejoge (5 min ke andar), wahi watch page ke top par advertise banner ban jaayega.\n\nYa seedha URL bhi de sakte ho:\n/advertise <image ya video ka URL>\n\nHatane ke liye: /advertise off")
+		default:
+			adType := "image"
+			lower := strings.ToLower(arg)
+			for _, ext := range []string{".mp4", ".webm", ".mov", ".mkv", ".m3u8"} {
+				if strings.HasSuffix(lower, ext) {
+					adType = "video"
+					break
+				}
+			}
+			if err := a.cache.setAdvertise(ctx, &adSettings{Enabled: true, Type: adType, URL: arg}); err != nil {
+				a.pool.send(msg.Chat.ID, "❌ Advertise set nahi ho paya, dobara try karo.")
+				return
+			}
+			a.pool.sendMD(msg.Chat.ID, fmt.Sprintf(
+				"✅ Advertise banner set ho gaya \\(%s\\)\\.\n\nWatch page ke top par ab yeh highlight hoke dikhega\\.", adType))
+		}
 	case "dminem":
 		if msg.From.ID != a.cfg.AdminID {
 			return
@@ -2313,7 +2392,87 @@ func (a *App) onCommand(ctx context.Context, msg *tgbotapi.Message) {
 	}
 }
 
+// storeAdvertiseMedia forwards an admin's photo/video to the DB channel —
+// same permanent storage the normal upload flow uses — and returns a
+// durable /stream/<slug> URL for it. This way the /advertise banner never
+// breaks, unlike Telegram's own temporary file links which expire.
+func (a *App) storeAdvertiseMedia(ctx context.Context, msg *tgbotapi.Message) (streamURL, adType string, err error) {
+	var fileName, mimeType string
+	var fileSize int64
+	switch {
+	case msg.Video != nil:
+		v := msg.Video
+		fileName = v.FileName
+		if fileName == "" {
+			fileName = "ad_video_" + v.FileUniqueID[:8] + ".mp4"
+		}
+		fileSize, mimeType, adType = int64(v.FileSize), "video/mp4", "video"
+	case len(msg.Photo) > 0:
+		ph := msg.Photo[len(msg.Photo)-1]
+		fileName = "ad_photo_" + ph.FileUniqueID[:8] + ".jpg"
+		fileSize, mimeType, adType = int64(ph.FileSize), "image/jpeg", "image"
+	default:
+		return "", "", fmt.Errorf("unsupported media for advertise")
+	}
+
+	fwdMsg, err := a.pool.next().Send(tgbotapi.NewForward(a.cfg.DBChannelID, msg.Chat.ID, msg.MessageID))
+	if err != nil {
+		return "", "", fmt.Errorf("forward failed: %w", err)
+	}
+
+	hash := makeShortHash(fileName, fileSize, fwdMsg.MessageID)
+	slug := uuid.New().String()
+	channelID := toInternalChannelID(a.cfg.DBChannelID)
+
+	rec := &FileRecord{
+		ID:           slug,
+		MessageID:    fwdMsg.MessageID,
+		ChannelID:    channelID,
+		FileName:     fileName,
+		FileSize:     fileSize,
+		MimeType:     mimeType,
+		Hash:         hash,
+		UploaderID:   msg.From.ID,
+		UploaderName: msg.From.UserName,
+	}
+	if err := a.db.saveFile(ctx, rec); err != nil {
+		return "", "", fmt.Errorf("db save failed: %w", err)
+	}
+	a.cache.setFile(ctx, slug, &cachedFile{
+		MessageID: fwdMsg.MessageID,
+		ChannelID: channelID,
+		FileName:  fileName,
+		FileSize:  fileSize,
+		MimeType:  mimeType,
+		Hash:      hash,
+	})
+
+	streamURL = fmt.Sprintf("%s/stream/%s", a.cfg.baseURL(), slug)
+	return streamURL, adType, nil
+}
+
 func (a *App) onFile(ctx context.Context, msg *tgbotapi.Message) {
+	// Agar admin ne pehle bare "/advertise" bheja tha (URL diye bina), to
+	// yeh agla photo/video normal upload nahi hoga — seedha ad banner ban
+	// jaayega, aur normal "file stored" flow yahin se return ho jaata hai.
+	if msg.From.ID == a.cfg.AdminID && a.cache.isAdvertisePending(ctx, msg.From.ID) &&
+		(msg.Video != nil || len(msg.Photo) > 0) {
+		a.cache.clearAdvertisePending(ctx, msg.From.ID)
+		streamURL, adType, err := a.storeAdvertiseMedia(ctx, msg)
+		if err != nil {
+			a.logger.Error("advertise media store failed", zap.Error(err))
+			a.pool.send(msg.Chat.ID, "❌ Advertise media store nahi ho paya, dobara try karo.")
+			return
+		}
+		if err := a.cache.setAdvertise(ctx, &adSettings{Enabled: true, Type: adType, URL: streamURL}); err != nil {
+			a.pool.send(msg.Chat.ID, "❌ Advertise set nahi ho paya, dobara try karo.")
+			return
+		}
+		a.pool.sendMD(msg.Chat.ID, fmt.Sprintf(
+			"✅ Advertise banner set ho gaya \\(%s\\)\\.\n\nWatch page ke top par ab yeh highlight hoke dikhega\\.", adType))
+		return
+	}
+
 	type fInfo struct {
 		fileName string
 		fileSize int64
@@ -2897,6 +3056,12 @@ type WatchData struct {
 	LiveCount   string
 	DeviceID    string
 	Slug        string
+
+	// /advertise se set hone wala top banner — AdEnabled false ho to
+	// index.html mein woh section bilkul render hi nahi hota.
+	AdEnabled bool
+	AdType    string // "image" ya "video"
+	AdURL     string
 }
 
 // renderSplash shows a one-time, 10-second opening screen — ASTRATOONIX
@@ -3967,6 +4132,11 @@ func (a *App) handleWatch(w http.ResponseWriter, r *http.Request, slug string) {
 		LiveCount:   fmt.Sprintf("%d", a.cache.liveCount(ctx, slug)),
 		DeviceID:    deviceID,
 		Slug:        slug,
+	}
+	if ad := a.cache.getAdvertise(ctx); ad != nil {
+		data.AdEnabled = true
+		data.AdType = ad.Type
+		data.AdURL = ad.URL
 	}
 
 	// index.html is baked into the container at /index.html (see Dockerfile)
